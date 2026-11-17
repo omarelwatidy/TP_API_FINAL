@@ -11,6 +11,7 @@ import ticketType from './ticketType.mjs';
 import ticket from './ticket.mjs';
 import shoppingItem from './shoppingItem.mjs';
 
+// On enregistre tous les modèles une seule fois sur la connexion MongoDB
 export default (connect) => ({
   User: connect.model('User', user),
   Event: connect.model('Event', event),

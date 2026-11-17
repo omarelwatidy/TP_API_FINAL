@@ -2,12 +2,14 @@ import jwt from 'jsonwebtoken';
 import config from '../config.mjs';
 import AppError from './AppError.mjs';
 
+// Crée le token envoyé à l'utilisateur quand il se connecte
 export const signToken = (user) => jwt.sign(
   { sub: String(user._id), role: user.role },
   config.jwtSecret,
   { algorithm: 'HS256', expiresIn: config.jwtExpiresIn }
 );
 
+// Vérifie le token de l'en-tête "Authorization: Bearer <token>"
 export const authenticate = (req, res, next) => {
   const [scheme, token] = (req.headers.authorization || '').split(' ');
 
@@ -23,11 +25,4 @@ export const authenticate = (req, res, next) => {
     const message = err.name === 'TokenExpiredError' ? 'Token expiré' : 'Token invalide';
     return next(new AppError(401, message));
   }
-};
-
-export const requireRole = (...roles) => (req, res, next) => {
-  if (!req.user || !roles.includes(req.user.role)) {
-    return next(new AppError(403, 'Accès interdit'));
-  }
-  return next();
 };

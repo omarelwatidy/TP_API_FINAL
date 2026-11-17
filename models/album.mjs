@@ -1,5 +1,4 @@
 import mongoose from 'mongoose';
-import { withJson } from './common.mjs';
 
 const { ObjectId } = mongoose.Schema.Types;
 
@@ -8,6 +7,17 @@ const Schema = new mongoose.Schema({
   title: { type: String, required: true, trim: true, minlength: 2, maxlength: 100 },
   description: { type: String, trim: true, maxlength: 1000, default: '' },
   createdBy: { type: ObjectId, ref: 'User', required: true }
-}, { collection: 'albums', timestamps: true, versionKey: false });
+}, {
+  collection: 'albums',
+  timestamps: true,
+  versionKey: false
+}).set('toJSON', {
+  transform: (doc, ret) => {
+    const result = ret;
+    result.id = result._id;
+    delete result._id;
+    return result;
+  }
+});
 
-export default withJson(Schema);
+export default Schema;

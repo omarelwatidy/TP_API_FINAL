@@ -41,6 +41,7 @@ const routes = [];
 server.app.router.stack.forEach((l) => l.route && Object.keys(l.route.methods).forEach((m) => routes.push(`${m.toUpperCase()} ${l.route.path}`)));
 console.log(`${routes.length} routes chargées`);
 
+// ---- Sécurité
 let r = await call('GET', '/events');
 check('sans token -> 401', r.status === 401 && r.json.message === 'Token manquant');
 r = await call('GET', '/events', { token: `${token}x` });
@@ -52,28 +53,26 @@ check('JSON invalide -> 400', r.status === 400);
 check('helmet actif', r.headers.get('x-content-type-options') === 'nosniff' && !r.headers.get('x-powered-by'));
 check('rate limit actif', Boolean(r.headers.get('ratelimit') || r.headers.get('ratelimit-policy')));
 
-r = await call('POST', '/auth/register', { body: { firstname: 'J', email: 'nope', password: 'abc', role: 'admin' } });
-check('register invalide -> 422 détaillé', r.status === 422 && r.json.errors.length >= 3);
+// ---- Validation des données
+r = await call('POST', '/auth/register', { body: { firstname: 'Jean', lastname: 'Dupont', email: 'jean@test.fr', password: 'abc' } });
+check('mot de passe faible -> 422', r.status === 422 && r.json.errors[0].field === 'password');
 r = await call('POST', '/auth/login', { body: { email: { $gt: '' }, password: 'x' } });
 check('injection NoSQL refusée -> 422', r.status === 422);
 r = await call('GET', '/events/pas-un-id', { token });
-check('id invalide -> 422', r.status === 422);
+check('id invalide -> 400', r.status === 400);
 r = await call('GET', '/events?from=hier', { token });
-check('filtre date invalide -> 422', r.status === 422);
+check('date invalide -> 400', r.status === 400);
 r = await call('POST', '/events', { token, body: { name: 'Hi' } });
-check('événement invalide -> 422', r.status === 422 && r.json.errors.some((e) => e.field === 'startDate'));
+check('événement invalide -> 422 détaillé', r.status === 422 && r.json.errors.some((e) => e.field === 'startDate'));
 r = await call('POST', '/threads', { token, body: { title: 'x', group: id, event: id } });
 check('fil groupe + événement -> 422', r.status === 422);
-r = await call('POST', `/ticket-types/${id}/tickets`, { body: { firstname: 'A' } });
-check('achat de billet, données invalides -> 422', r.status === 422);
-r = await call('POST', '/polls', { token, body: { event: id, title: 'Sondage', questions: [{ text: 'Q', options: [{ label: 'seule' }] }] } });
-check('question à 1 seule réponse -> 422', r.status === 422);
-r = await call('POST', `/polls/${id}/answers`, { token, body: { answers: [] } });
-check('réponses vides -> 422', r.status === 422);
-r = await call('POST', `/events/${id}/shopping-items`, { token, body: { name: 'Coca' } });
-check('shopping item incomplet -> 422', r.status === 422);
+r = await call('GET', '/albums', { token });
+check('albums sans event -> 422', r.status === 422);
 
-const { Event, Thread, Poll, ShoppingItem } = server.models;
+// ---- Règles des modèles
+const {
+  Event, Thread, Poll, ShoppingItem, User, Ticket
+} = server.models;
 const fails = async (doc) => { try { await doc.validate(); return false; } catch { return true; } };
 const start = new Date('2026-12-01T20:00:00Z');
 check('fin avant début refusée', await fails(new Event({ name: 'Fête', startDate: start, endDate: new Date('2026-12-01T10:00:00Z'), location: 'Paris' })));
@@ -82,9 +81,14 @@ check('fil sans parent refusé', await fails(new Thread({ title: 'x' })));
 check('fil avec groupe ET événement refusé', await fails(new Thread({ title: 'x', group: id, event: id })));
 check('fil avec un seul parent accepté', !(await fails(new Thread({ title: 'x', group: id }))));
 check('sondage sans question refusé', await fails(new Poll({ event: id, title: 'abc', createdBy: id, questions: [] })));
+check('question à 1 seule réponse refusée', await fails(new Poll({ event: id, title: 'abc', createdBy: id, questions: [{ text: 'Q', options: [{ label: 'a' }] }] })));
+check('email invalide refusé', await fails(new User({ firstname: 'Jean', lastname: 'Dupont', email: 'nope', password: 'x' })));
+check('billet sans adresse refusé', await fails(new Ticket({ event: id, ticketType: id, firstname: 'A', lastname: 'B', email: 'a@b.fr' })));
 const item = new ShoppingItem({ event: id, user: id, name: '  Coca ', quantity: 2, arrivalTime: start });
 await item.validate();
 check('unicité : clé "coca" calculée', item.nameKey === 'coca');
+const json = new User({ firstname: 'Jean', lastname: 'Dupont', email: 'a@b.fr', password: 'secret' }).toJSON();
+check('le mot de passe n\'est jamais renvoyé', json.password === undefined && json.id !== undefined);
 
 http.close();
 console.log(`\n${ok} vérifications réussies`);

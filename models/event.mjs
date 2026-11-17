@@ -1,5 +1,4 @@
 import mongoose from 'mongoose';
-import { withJson } from './common.mjs';
 
 const { ObjectId } = mongoose.Schema.Types;
 
@@ -18,10 +17,10 @@ const Schema = new mongoose.Schema({
     }
   },
   location: { type: String, required: true, trim: true, maxlength: 300 },
-  coverPhoto: { type: String, trim: true, maxlength: 500 },
+  coverPhoto: { type: String, trim: true, maxlength: 500, match: [/^https?:\/\/\S+$/, 'URL invalide'] },
   visibility: { type: String, enum: ['public', 'private'], default: 'public' },
-  organizers: [{ type: ObjectId, ref: 'User' }],
-  members: [{ type: ObjectId, ref: 'User' }],
+  organizers: [{ type: ObjectId, ref: 'User' }], // au moins 1
+  members: [{ type: ObjectId, ref: 'User' }], // les participants
   group: { type: ObjectId, ref: 'Group' },
   createdBy: { type: ObjectId, ref: 'User' },
   shoppingListEnabled: { type: Boolean, default: false },
@@ -35,8 +34,17 @@ const Schema = new mongoose.Schema({
       message: 'La billetterie est réservée aux événements publics'
     }
   }
-}, { collection: 'events', timestamps: true, versionKey: false });
+}, {
+  collection: 'events',
+  timestamps: true,
+  versionKey: false
+}).set('toJSON', {
+  transform: (doc, ret) => {
+    const result = ret;
+    result.id = result._id;
+    delete result._id;
+    return result;
+  }
+});
 
-Schema.index({ startDate: 1 });
-
-export default withJson(Schema);
+export default Schema;

@@ -1,25 +1,10 @@
 import bcrypt from 'bcryptjs';
-import { body, query } from 'express-validator';
-import validate from '../middleware/validate.mjs';
+import AppError from '../middleware/AppError.mjs';
 import { authenticate } from '../middleware/auth.mjs';
 import {
-  findOr404, allow, paginate, pageOf, escapeRegex, pick, sameId
-} from '../services/helpers.mjs';
-import { isSiteAdmin } from '../services/access.mjs';
-import {
-  text, url, email, strongPassword, idParam, pagination, search
-} from '../services/rules.mjs';
-
-const updateRules = () => [
-  text('firstname', { min: 2, max: 50, optional: true }),
-  text('lastname', { min: 2, max: 50, optional: true }),
-  email(true),
-  strongPassword(true),
-  body('age').optional().isInt({ min: 0, max: 120 }).withMessage('age : entier entre 0 et 120').toInt(),
-  text('city', { max: 100, optional: true }),
-  url('avatar'),
-  body('role').optional().isIn(['user', 'admin']).withMessage('role : user | admin')
-];
+  sameId, escapeRegex, pick, getPagination, pageResult, isAdmin
+} from '../middleware/checks.mjs';
+import { isStrongPassword } from './auth.mjs';
 
 const Users = class Users {
   constructor(app, models) {
@@ -29,58 +14,71 @@ const Users = class Users {
     this.run();
   }
 
-  // L'email n'est visible que par la personne concernée et par un admin
+  // L'email n'est visible que par la personne elle-même et par un admin
   view(user, me) {
     const json = user.toJSON();
-    if (!sameId(user, me.id) && !isSiteAdmin(me)) {
+    if (!sameId(user.id, me.id) && !isAdmin(me)) {
       delete json.email;
     }
     return json;
   }
 
   searchUsers() {
-    const rules = [...pagination, search, query('city').optional().isString().isLength({ max: 100 })];
-
-    this.app.get('/users', authenticate, rules, validate, async (req, res) => {
-      const { User } = this.models;
-      const p = paginate(req.query);
+    this.app.get('/users', authenticate, async (req, res) => {
+      const p = getPagination(req.query);
       const filter = {};
 
       if (req.query.q) {
-        const re = new RegExp(escapeRegex(req.query.q), 'i');
-        filter.$or = [{ firstname: re }, { lastname: re }];
+        const regex = new RegExp(escapeRegex(req.query.q), 'i');
+        filter.$or = [{ firstname: regex }, { lastname: regex }];
       }
       if (req.query.city) {
         filter.city = new RegExp(escapeRegex(req.query.city), 'i');
       }
 
-      const [users, total] = await Promise.all([
-        User.find(filter).sort({ lastname: 1, firstname: 1 }).skip(p.skip).limit(p.limit),
-        User.countDocuments(filter)
-      ]);
+      const users = await this.models.User.find(filter)
+        .sort({ lastname: 1, firstname: 1 })
+        .skip(p.skip)
+        .limit(p.limit);
+      const total = await this.models.User.countDocuments(filter);
 
-      res.status(200).json(pageOf(users.map((u) => this.view(u, req.user)), total, p));
+      res.status(200).json(pageResult(users.map((u) => this.view(u, req.user)), total, p));
     });
   }
 
   show() {
-    this.app.get('/users/:id', authenticate, idParam(), validate, async (req, res) => {
-      const user = await findOr404(this.models.User.findById(req.params.id), 'Utilisateur');
+    this.app.get('/users/:id', authenticate, async (req, res) => {
+      const user = await this.models.User.findById(req.params.id);
+      if (!user) throw new AppError(404, 'Utilisateur introuvable');
+
       res.status(200).json(this.view(user, req.user));
     });
   }
 
   update() {
-    this.app.put('/users/:id', authenticate, idParam(), updateRules(), validate, async (req, res) => {
-      allow(sameId(req.params.id, req.user.id) || isSiteAdmin(req.user));
+    this.app.put('/users/:id', authenticate, async (req, res) => {
+      // On modifie son propre compte (un admin peut modifier tous les comptes)
+      if (!sameId(req.params.id, req.user.id) && !isAdmin(req.user)) {
+        throw new AppError(403, 'Accès interdit');
+      }
 
-      const user = await findOr404(this.models.User.findById(req.params.id), 'Utilisateur');
+      const user = await this.models.User.findById(req.params.id);
+      if (!user) throw new AppError(404, 'Utilisateur introuvable');
+
       user.set(pick(req.body, ['firstname', 'lastname', 'email', 'age', 'city', 'avatar']));
 
-      if (req.body.password) {
+      if (req.body.password !== undefined) {
+        if (!isStrongPassword(req.body.password)) {
+          throw new AppError(422, 'Données invalides', [{
+            field: 'password',
+            message: 'password : 8 caractères min, avec majuscule, minuscule et chiffre'
+          }]);
+        }
         user.password = await bcrypt.hash(req.body.password, 12);
       }
-      if (req.body.role && isSiteAdmin(req.user)) {
+
+      // Seul un admin peut changer le rôle
+      if (req.body.role !== undefined && isAdmin(req.user)) {
         user.role = req.body.role;
       }
 
@@ -90,14 +88,18 @@ const Users = class Users {
   }
 
   remove() {
-    this.app.delete('/users/:id', authenticate, idParam(), validate, async (req, res) => {
-      allow(sameId(req.params.id, req.user.id) || isSiteAdmin(req.user));
+    this.app.delete('/users/:id', authenticate, async (req, res) => {
+      if (!sameId(req.params.id, req.user.id) && !isAdmin(req.user)) {
+        throw new AppError(403, 'Accès interdit');
+      }
 
-      const { User, Event, Group } = this.models;
-      await findOr404(User.findByIdAndDelete(req.params.id), 'Utilisateur');
+      const user = await this.models.User.findByIdAndDelete(req.params.id);
+      if (!user) throw new AppError(404, 'Utilisateur introuvable');
 
-      await Event.updateMany({}, { $pull: { members: req.params.id, organizers: req.params.id } });
-      await Group.updateMany({}, { $pull: { members: req.params.id, admins: req.params.id } });
+      // On retire l'utilisateur des événements et des groupes
+      const id = req.params.id;
+      await this.models.Event.updateMany({}, { $pull: { members: id, organizers: id } });
+      await this.models.Group.updateMany({}, { $pull: { members: id, admins: id } });
 
       res.status(204).end();
     });

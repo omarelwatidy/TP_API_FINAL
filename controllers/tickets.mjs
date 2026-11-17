@@ -1,15 +1,9 @@
-import { body, query } from 'express-validator';
-import validate from '../middleware/validate.mjs';
 import AppError from '../middleware/AppError.mjs';
 import { authenticate } from '../middleware/auth.mjs';
 import { authLimiter } from '../middleware/rateLimit.mjs';
 import {
-  findOr404, allow, pick, escapeRegex, paginate, pageOf
-} from '../services/helpers.mjs';
-import { loadEvent, isEventOrganizer } from '../services/access.mjs';
-import {
-  text, number, email, idParam, idBody, idQuery, pagination
-} from '../services/rules.mjs';
+  escapeRegex, pick, getPagination, pageResult, getEvent, isOrganizer
+} from '../middleware/checks.mjs';
 
 const Tickets = class Tickets {
   constructor(app, models) {
@@ -19,8 +13,8 @@ const Tickets = class Tickets {
     this.run();
   }
 
-  // Billetterie accessible à tout le monde : événement public avec billetterie activée
-  async publicTicketedEvent(id) {
+  // La billetterie est ouverte à tout le monde : événement public avec billetterie activée
+  async getPublicEvent(id) {
     const event = await this.models.Event.findById(id);
     if (!event || event.visibility !== 'public' || !event.ticketingEnabled) {
       throw new AppError(404, 'Billetterie introuvable');
@@ -28,202 +22,203 @@ const Tickets = class Tickets {
     return event;
   }
 
-  async loadType(id, user) {
-    const type = await findOr404(this.models.TicketType.findById(id), 'Type de billet');
-    const event = await loadEvent(this.models, type.event, user);
-    allow(isEventOrganizer(event, user), 'Réservé aux organisateurs');
-    return { type, event };
+  // Cherche un type de billet. Réservé aux organisateurs de l'événement.
+  async getTypeAsOrganizer(id, user) {
+    const type = await this.models.TicketType.findById(id);
+    if (!type) throw new AppError(404, 'Type de billet introuvable');
+
+    const event = await getEvent(this.models, type.event, user);
+    if (!isOrganizer(event, user)) throw new AppError(403, 'Réservé aux organisateurs');
+
+    return type;
   }
 
-  async loadTicket(id, user) {
-    const ticket = await findOr404(this.models.Ticket.findById(id), 'Billet');
-    const event = await loadEvent(this.models, ticket.event, user);
-    allow(isEventOrganizer(event, user), 'Réservé aux organisateurs');
-    return { ticket, event };
+  async getTicketAsOrganizer(id, user) {
+    const ticket = await this.models.Ticket.findById(id);
+    if (!ticket) throw new AppError(404, 'Billet introuvable');
+
+    const event = await getEvent(this.models, ticket.event, user);
+    if (!isOrganizer(event, user)) throw new AppError(403, 'Réservé aux organisateurs');
+
+    return ticket;
   }
 
-  // ------------------------------------------------------------ Types de billets
+  // ---------------------------------------------------- Types de billets
   createType() {
-    const rules = () => [
-      idBody('event'),
-      text('name', { min: 2, max: 100 }),
-      number('price', { min: 0 }),
-      body('quantity').isInt({ min: 1 }).withMessage('quantity : entier >= 1').toInt()
-    ];
-
-    this.app.post('/ticket-types', authenticate, rules(), validate, async (req, res) => {
-      const event = await loadEvent(this.models, req.body.event, req.user);
-      allow(isEventOrganizer(event, req.user), 'Seul un organisateur peut créer des billets');
-
+    this.app.post('/ticket-types', authenticate, async (req, res) => {
+      const event = await getEvent(this.models, req.body.event, req.user);
+      if (!isOrganizer(event, req.user)) {
+        throw new AppError(403, 'Seul un organisateur peut créer des billets');
+      }
       if (event.visibility !== 'public' || !event.ticketingEnabled) {
         throw new AppError(409, 'La billetterie doit être activée sur un événement public (ticketingEnabled: true)');
       }
-      const type = await this.models.TicketType.create(pick(req.body, ['event', 'name', 'price', 'quantity']));
+
+      const type = await this.models.TicketType.create({
+        event: event.id,
+        name: req.body.name,
+        price: req.body.price,
+        quantity: req.body.quantity
+      });
+
       res.status(201).json(type);
     });
   }
 
+  // Route publique : pas besoin d'être connecté
   listTypes() {
-    this.app.get('/events/:id/ticket-types', idParam(), validate, async (req, res) => {
-      const event = await this.publicTicketedEvent(req.params.id);
+    this.app.get('/events/:id/ticket-types', async (req, res) => {
+      const event = await this.getPublicEvent(req.params.id);
       const types = await this.models.TicketType.find({ event: event.id }).sort({ price: 1 });
+
       res.status(200).json(types);
     });
   }
 
   showType() {
-    this.app.get('/ticket-types/:id', idParam(), validate, async (req, res) => {
-      const type = await findOr404(this.models.TicketType.findById(req.params.id), 'Type de billet');
-      await this.publicTicketedEvent(type.event);
+    this.app.get('/ticket-types/:id', async (req, res) => {
+      const type = await this.models.TicketType.findById(req.params.id);
+      if (!type) throw new AppError(404, 'Type de billet introuvable');
+      await this.getPublicEvent(type.event);
+
       res.status(200).json(type);
     });
   }
 
   updateType() {
-    const rules = () => [
-      text('name', { min: 2, max: 100, optional: true }),
-      number('price', { min: 0, optional: true }),
-      body('quantity').optional().isInt({ min: 1 }).withMessage('quantity : entier >= 1').toInt()
-    ];
+    this.app.put('/ticket-types/:id', authenticate, async (req, res) => {
+      const type = await this.getTypeAsOrganizer(req.params.id, req.user);
 
-    this.app.put('/ticket-types/:id', authenticate, idParam(), rules(), validate, async (req, res) => {
-      const { type } = await this.loadType(req.params.id, req.user);
-
-      if (req.body.quantity !== undefined && req.body.quantity < type.sold) {
+      // On ne peut pas descendre sous le nombre de billets déjà vendus
+      if (req.body.quantity !== undefined && Number(req.body.quantity) < type.sold) {
         throw new AppError(422, `quantity ne peut pas être inférieure aux billets déjà vendus (${type.sold})`);
       }
+
       type.set(pick(req.body, ['name', 'price', 'quantity']));
       await type.save();
+
       res.status(200).json(type);
     });
   }
 
   removeType() {
-    this.app.delete('/ticket-types/:id', authenticate, idParam(), validate, async (req, res) => {
-      const { type } = await this.loadType(req.params.id, req.user);
+    this.app.delete('/ticket-types/:id', authenticate, async (req, res) => {
+      const type = await this.getTypeAsOrganizer(req.params.id, req.user);
 
       if (type.sold > 0) {
         throw new AppError(409, 'Des billets ont déjà été vendus pour ce type');
       }
+
       await type.deleteOne();
       res.status(204).end();
     });
   }
 
-  // ------------------------------------------------------------------- Billets
-  // Achat ouvert aux personnes extérieures (pas de compte nécessaire)
+  // ----------------------------------------------------------- Billets
+  // Achat ouvert aux personnes extérieures : pas besoin de compte
   buy() {
-    const rules = () => [
-      text('firstname', { min: 1, max: 50 }),
-      text('lastname', { min: 1, max: 50 }),
-      email(),
-      body('address').isObject().withMessage('address : objet attendu'),
-      text('address.street', { min: 2, max: 200 }),
-      text('address.zipCode', { min: 2, max: 20 }),
-      text('address.city', { min: 2, max: 100 }),
-      text('address.country', { min: 2, max: 100 })
-    ];
-
-    this.app.post('/ticket-types/:id/tickets', authLimiter, idParam(), rules(), validate, async (req, res) => {
+    this.app.post('/ticket-types/:id/tickets', authLimiter, async (req, res) => {
       const { TicketType, Ticket } = this.models;
-      const type = await findOr404(TicketType.findById(req.params.id), 'Type de billet');
-      const event = await this.publicTicketedEvent(type.event);
-      const { firstname, lastname, email: mail } = req.body;
 
-      // 1 seul billet par personne et par événement
-      if (await Ticket.exists({ event: event.id, email: mail })) {
+      const type = await TicketType.findById(req.params.id);
+      if (!type) throw new AppError(404, 'Type de billet introuvable');
+      const event = await this.getPublicEvent(type.event);
+
+      const ticket = new Ticket({
+        event: event.id,
+        ticketType: type.id,
+        firstname: req.body.firstname,
+        lastname: req.body.lastname,
+        email: req.body.email,
+        address: pick(req.body.address, ['street', 'zipCode', 'city', 'country'])
+      });
+      await ticket.validate(); // vérifie les données avant de réserver une place
+
+      // Une seule place par personne et par événement
+      const already = await Ticket.exists({ event: event.id, email: ticket.email });
+      if (already) {
         throw new AppError(409, 'Cette personne possède déjà un billet pour cet événement');
       }
 
-      // Réservation atomique d'une place : impossible de dépasser la quantité, même en requêtes simultanées
+      // On réserve une place en une seule opération : même si plusieurs personnes achètent en
+      // même temps, "sold" ne peut jamais dépasser "quantity".
       const reserved = await TicketType.findOneAndUpdate(
         { _id: type.id, $expr: { $lt: ['$sold', '$quantity'] } },
-        { $inc: { sold: 1 } },
-        { returnDocument: 'after' }
+        { $inc: { sold: 1 } }
       );
       if (!reserved) {
         throw new AppError(409, 'Plus de billets disponibles pour ce type');
       }
 
       try {
-        const ticket = await Ticket.create({
-          event: event.id,
-          ticketType: type.id,
-          firstname,
-          lastname,
-          email: mail,
-          address: pick(req.body.address, ['street', 'zipCode', 'city', 'country'])
-        });
-        res.status(201).json(ticket);
+        await ticket.save();
       } catch (err) {
-        await TicketType.updateOne({ _id: type.id }, { $inc: { sold: -1 } }); // on rend la place
+        // Le billet n'a pas pu être créé : on rend la place
+        await TicketType.updateOne({ _id: type.id }, { $inc: { sold: -1 } });
         if (err.code === 11000) {
           throw new AppError(409, 'Cette personne possède déjà un billet pour cet événement');
         }
         throw err;
       }
+
+      res.status(201).json(ticket);
     });
   }
 
   listTickets() {
-    const rules = () => [...pagination, idQuery('ticketType', true), query('q').optional().isString().isLength({ max: 100 })];
+    this.app.get('/events/:id/tickets', authenticate, async (req, res) => {
+      const event = await getEvent(this.models, req.params.id, req.user);
+      if (!isOrganizer(event, req.user)) throw new AppError(403, 'Réservé aux organisateurs');
 
-    this.app.get('/events/:id/tickets', authenticate, idParam(), rules(), validate, async (req, res) => {
-      const event = await loadEvent(this.models, req.params.id, req.user);
-      allow(isEventOrganizer(event, req.user), 'Réservé aux organisateurs');
-
-      const p = paginate(req.query);
+      const p = getPagination(req.query);
       const filter = { event: event.id };
       if (req.query.ticketType) {
-        filter.ticketType = req.query.ticketType;
+        filter.ticketType = String(req.query.ticketType);
       }
       if (req.query.q) {
-        const re = new RegExp(escapeRegex(req.query.q), 'i');
-        filter.$or = [{ firstname: re }, { lastname: re }, { email: re }];
+        const regex = new RegExp(escapeRegex(req.query.q), 'i');
+        filter.$or = [{ firstname: regex }, { lastname: regex }, { email: regex }];
       }
 
-      const [tickets, total] = await Promise.all([
-        this.models.Ticket.find(filter).sort({ purchasedAt: -1 }).skip(p.skip).limit(p.limit),
-        this.models.Ticket.countDocuments(filter)
-      ]);
-      res.status(200).json(pageOf(tickets, total, p));
+      const tickets = await this.models.Ticket.find(filter).sort({ purchasedAt: -1 }).skip(p.skip).limit(p.limit);
+      const total = await this.models.Ticket.countDocuments(filter);
+
+      res.status(200).json(pageResult(tickets, total, p));
     });
   }
 
   showTicket() {
-    this.app.get('/tickets/:id', authenticate, idParam(), validate, async (req, res) => {
-      const { ticket } = await this.loadTicket(req.params.id, req.user);
+    this.app.get('/tickets/:id', authenticate, async (req, res) => {
+      const ticket = await this.getTicketAsOrganizer(req.params.id, req.user);
       res.status(200).json(ticket);
     });
   }
 
   updateTicket() {
-    const rules = () => [
-      text('firstname', { min: 1, max: 50, optional: true }),
-      text('lastname', { min: 1, max: 50, optional: true }),
-      text('address.street', { min: 2, max: 200, optional: true }),
-      text('address.zipCode', { min: 2, max: 20, optional: true }),
-      text('address.city', { min: 2, max: 100, optional: true }),
-      text('address.country', { min: 2, max: 100, optional: true })
-    ];
-
-    this.app.put('/tickets/:id', authenticate, idParam(), rules(), validate, async (req, res) => {
-      const { ticket } = await this.loadTicket(req.params.id, req.user);
+    this.app.put('/tickets/:id', authenticate, async (req, res) => {
+      const ticket = await this.getTicketAsOrganizer(req.params.id, req.user);
 
       ticket.set(pick(req.body, ['firstname', 'lastname']));
-      Object.entries(pick(req.body.address, ['street', 'zipCode', 'city', 'country']))
-        .forEach(([key, value]) => ticket.set(`address.${key}`, value));
+
+      // On modifie seulement les champs d'adresse envoyés
+      const address = pick(req.body.address, ['street', 'zipCode', 'city', 'country']);
+      Object.keys(address).forEach((key) => {
+        ticket.set(`address.${key}`, address[key]);
+      });
+
       await ticket.save();
       res.status(200).json(ticket);
     });
   }
 
   removeTicket() {
-    this.app.delete('/tickets/:id', authenticate, idParam(), validate, async (req, res) => {
-      const { ticket } = await this.loadTicket(req.params.id, req.user);
+    this.app.delete('/tickets/:id', authenticate, async (req, res) => {
+      const ticket = await this.getTicketAsOrganizer(req.params.id, req.user);
 
       await ticket.deleteOne();
+      // La place est de nouveau disponible
       await this.models.TicketType.updateOne({ _id: ticket.ticketType }, { $inc: { sold: -1 } });
+
       res.status(204).end();
     });
   }
